@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>KataGo 最小対局UI (黒=あなた / 白=AI)</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 16px; }
+  .row { display:flex; gap:12px; align-items:center; flex-wrap:wrap; margin: 8px 0; }
+  .board { display: grid; grid-template-columns: repeat(19, 28px); grid-template-rows: repeat(19, 28px); gap: 2px; }
+  .cell { width: 28px; height: 28px; background: #d7b77a; position: relative; border-radius: 4px; cursor: pointer; }
+  .hoshi::after { content:""; position:absolute; width:6px; height:6px; background:#333; border-radius:50%; top:50%; left:50%; transform:translate(-50%,-50%); }
+  .stone { position:absolute; inset:3px; border-radius:50%; box-shadow: inset 0 1px 2px rgba(0,0,0,.4); }
+  .black { background:#111; }
+  .white { background:#f4f4f4; border:1px solid #ccc; }
+  button { padding:8px 12px; border-radius:8px; border:1px solid #ccc; background:#fff; cursor:pointer; }
+  input[type=number]{ width: 70px; }
+  .info { font-size:14px; color:#333; }
+  pre { margin-top:12px; background:#fafafa; padding:8px; border:1px solid #eee; border-radius:8px; max-height:260px; overflow:auto; }
+</style>
+</head>
+<body>
+  <h2>KataGo 最小対局UI <small>(黒=あなた / 白=AI)</small></h2>
+
+  <div class="row">
+    <button id="resetBtn">盤をクリア</button>
+    <label>時間上限(s): <input id="maxTime" type="number" min="1" step="1" value="5"></label>
+    <span class="info" id="status">黒番です。セルをクリックして着手してください。</span>
+  </div>
+
+  <div class="row">
+    <strong>スプリント（中盤から開始）</strong>
+    <label>生成手数(合計): <input id="totalPly" type="number" min="2" max="200" step="2" value="30"></label>
+    <label><input type="radio" name="budget" value="time" checked> 1手あたり時間(s)</label>
+    <input id="perMoveTime" type="number" min="0.05" step="0.05" value="0.20">
+    <label><input type="radio" name="budget" value="visits"> 1手あたりvisits</label>
+    <input id="perMoveVisits" type="number" min="1" step="1" value="5">
+    <button id="sprintBtn">スプリント開始</button>
+  </div>
+
+  <div id="board" class="board"></div>
+  <pre id="last"></pre>
+
+<script>
+const N = 19;
+const boardEl = document.getElementById('board');
+const statusEl = document.getElementById('status');
+const lastEl = document.getElementById('last');
+const maxTimeEl = document.getElementById('maxTime');
+const resetBtn = document.getElementById('resetBtn');
+const sprintBtn = document.getElementById('sprintBtn');
+const totalPlyEl = document.getElementById('totalPly');
+const perMoveTimeEl = document.getElementById('perMoveTime');
+const perMoveVisitsEl = document.getElementById('perMoveVisits');
+
+let board = Array.from({length:N}, () => Array(N).fill(0)); // 0=空,1=黒,2=白
+let moves = [];     // [["B","K10"],["W","D16"],...]
+let yourTurn = true; // 黒から
+
+// 座標ヘルパ（Iを飛ばす）
+const letters = "ABCDEFGHJKLMNOPQRST".split(""); // no I
+function toCoord(x, y) { // x=0左, y=0上
+  const col = letters[x];
+  const row = (N - y).toString();
+  return col + row;
+}
+function fromCoord(cs) {
+  const colLetter = cs[0];
+  const rowNum = parseInt(cs.slice(1),10);
+  const x = letters.indexOf(colLetter);
+  const y = N - rowNum;
+  return {x,y};
+}
+
+// 近傍・連結・置石（最小実装：コウ未対応）
+function neighbors(x,y){ return [[x-1,y],[x+1,y],[x,y-1],[x,y+1]].filter(([a,b])=>a>=0&&a<N&&b>=0&&b<N); }
+function flood(x,y,color,vis=new Set()){
+  const key = `${x},${y}`; if (vis.has(key)) return {stones:[],libs:new Set()};
+  vis.add(key);
+  let stones=[[x,y]], libs=new Set();
+  for (const [nx,ny] of neighbors(x,y)){
+    if (board[ny][nx]===0) libs.add(`${nx},${ny}`);
+    else if (board[ny][nx]===color){
+      const r=flood(nx,ny,color,vis); stones=stones.concat(r.stones); r.libs.forEach(s=>libs.add(s));
+    }
+  }
+  return {stones,libs};
+}
+function place(color,x,y){
+  if (board[y][x]!==0) return false;
+  const me=color==='B'?1:2, opp=color==='B'?2:1;
+  board[y][x]=me;
+  // 相手取り
+  let cap=0;
+  for (const [nx,ny] of neighbors(x,y)){
+    if (board[ny][nx]===opp){
+      const g=flood(nx,ny,opp,new Set());
+      if (g.libs.size===0){ for (const [sx,sy] of g.stones){ board[sy][sx]=0; cap++; } }
+    }
+  }
+  // 自殺チェック
+  const mine=flood(x,y,me,new Set());
+  if (mine.libs.size===0 && cap===0){ board[y][x]=0; return false; }
+  return true;
+}
+function clearBoard(){
+  board = Array.from({length:N}, () => Array(N).fill(0));
+  moves = [];
+  yourTurn = true;
+  lastEl.textContent = "";
+  statusEl.textContent = "黒番です。セルをクリックして着手してください。";
+  draw();
+}
+function applyMoves(seq){
+  console.log("[applyMoves] seq=", seq); // ★ログ追加
+
+  clearBoard();
+  for (const [c,cs] of seq){
+    console.log("[applyMoves] stone:", c, cs); // ★ログ追加
+    const {x,y} = fromCoord(cs);
+    place(c, x, y);
+    moves.push([c, cs]);
+  }
+  draw();
+}
+
+function draw(){
+  boardEl.innerHTML="";
+  for (let y=0;y<N;y++) for (let x=0;x<N;x++){
+    const cell=document.createElement('div');
+    cell.className='cell';
+    const hoshi=((x===3||x===9||x===15)&&(y===3||y===9||y===15));
+    if (hoshi) cell.classList.add('hoshi');
+    const v=board[y][x];
+    if (v){
+      console.log("[draw] at", x, y, "color=", v===1?"B":"W");
+      const st=document.createElement('div');
+      st.className='stone ' + (v===1?'black':'white');
+      cell.appendChild(st);
+    }
+    cell.addEventListener('click', async ()=>{
+      if(!yourTurn) return;
+      if(!place('B',x,y)){ statusEl.textContent="そこには打てません。"; return; }
+      const mv = toCoord(x,y);
+      moves.push(["B", mv]);
+      yourTurn=false;
+      statusEl.textContent="AI思考中…";
+      draw();
+      await aiReply();
+    });
+    boardEl.appendChild(cell);
+  }
+}
+
+// サーバへ：通常1手応答
+async function aiReply(){
+  try{
+    const maxTime = parseInt(maxTimeEl.value||"5",10);
+    const resp = await fetch("/api/analyze",{
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({ moves, maxTime, rules:"japanese", komi:6.5 })
+    });
+    const data = await resp.json();
+    lastEl.textContent = JSON.stringify(data.katago, null, 2);
+    const mv = data.bestMove;
+    if(!mv){ statusEl.textContent="AIの手が得られませんでした。"; yourTurn=true; return; }
+    const {x,y}=fromCoord(mv);
+    if(!place('W',x,y)){ statusEl.textContent=`AI手(${mv})が置けませんでした。`; yourTurn=true; draw(); return; }
+    moves.push(["W", mv]);
+    const r = data.katago.rootInfo;
+    statusEl.textContent = `黒番です。 (AI visits=${r.visits}, winrate=${(r.winrate*100).toFixed(1)}%)`;
+    yourTurn=true;
+    draw();
+  }catch(e){
+    statusEl.textContent="通信エラー: "+e;
+    yourTurn=true;
+  }
+}
+
+// サーバへ：まとめて生成（スプリント）
+async function startSprint(){
+  try{
+    const totalPly = parseInt(totalPlyEl.value||"30",10);
+    if (totalPly % 2 === 1) totalPlyEl.value = String(totalPly+1);
+
+    const budget = document.querySelector('input[name="budget"]:checked')?.value || "time";
+    const payload = {
+      totalPly: parseInt(totalPlyEl.value,10),
+      rules: "japanese", komi: 6.5,
+    };
+    if (budget === "time") payload.perMoveMaxTime = parseFloat(perMoveTimeEl.value||"0.2");
+    else payload.perMoveMaxVisits = parseInt(perMoveVisitsEl.value||"5",10);
+
+    statusEl.textContent = "スプリント局面生成中…";
+
+    const url = window.location.origin + "/api/start-from-middle";
+    const resp = await fetch(url, {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify(payload),
+    });
+
+    // Content-Type を確認してHTML誤配信を検出
+    const ct = resp.headers.get("content-type") || "";
+    if (!resp.ok) {
+      const text = await resp.text();
+      throw new Error(`HTTP ${resp.status} ${resp.statusText}: ${text.slice(0,200)}`);
+    }
+    if (!ct.includes("application/json")) {
+      const text = await resp.text();
+      throw new Error(`Expected JSON but got: ${ct}. Body: ${text.slice(0,200)}`);
+    }
+
+    const data = await resp.json();
+    if (!data.ok) throw new Error(data.error || "unknown error");
+
+    applyMoves(data.startMoves);
+
+    yourTurn = (data.startMoves.length % 2 === 0);
+    if (!yourTurn) {
+      await aiReply();
+    } else {
+      if (data.last) lastEl.textContent = JSON.stringify(data.last, null, 2);
+      statusEl.textContent = "黒番です。（スプリント開始局面）";
+    }
+  }catch(e){
+    statusEl.textContent = "生成エラー: " + e.message;
+    console.error(e);
+  }
+}
+
+resetBtn.addEventListener('click', clearBoard);
+sprintBtn.addEventListener('click', startSprint);
+draw();
+</script>
+</body>
+</html>

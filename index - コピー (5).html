@@ -1,0 +1,457 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>中盤限定囲碁（黒=あなた/白=AI）</title>
+<style>
+  body{font-family:system-ui,sans-serif;margin:16px;padding-right:12px;box-sizing:border-box;}
+  .hud{margin:8px 0;display:flex;flex-direction:column;gap:8px;}
+  .hud-row{display:flex;gap:12px;align-items:center;flex-wrap:wrap;}
+  .hud-row .eval{margin-right:8px;}
+  button{padding:8px 12px;border-radius:8px;border:1px solid #ccc;background:#fff;cursor:pointer}
+  #sprintBtn{background:#3f51b5;color:#fff;border:none} #sprintBtn:hover{background:#303f9f}
+  #resetBtn{background:#8d6e63;color:#fff;border:none}   #resetBtn:hover{background:#6d4c41}
+  .board-wrap{display:flex;justify-content:flex-start;width:100%}
+  .board,.cell,.hud button{touch-action:manipulation;-webkit-tap-highlight-color:transparent;user-select:none;-webkit-user-select:none}
+  .board{
+  position:relative;
+  display:grid;
+  grid-template-columns:repeat(19,28px);
+  grid-template-rows:repeat(19,28px);
+  width:calc(19 * 28px);
+  height:calc(19 * 28px);
+  background:url("./board_19x19_3.png") no-repeat center/100% 100%;
+  margin:0 auto;              /* ← 中央寄せ：左右に均等な余白ができる */
+  float:none;
+  }
+
+/* 盤の右に“指の逃げ場”と透明ヒットボックスを用意 */
+.board-shelf{ position:relative; display:inline-block; }
+.hitbox-right{
+  position:absolute; top:0; right:0; width:0; height:100%;
+  pointer-events:auto; background:transparent;
+}
+
+/* スマホ時：右ガターを常に確保し、ヒットボックスを盤の外へ張り出す */
+@media (max-width: 640px){
+  .board-shelf{ padding-right:max(24px, env(safe-area-inset-right, 0px)); }
+  .hitbox-right{ width:32px; transform:translateX(50%); } /* 盤の外へ約16px張り出し */
+}
+
+
+
+/* スマホでの右端誤タップを防ぐための“安全マージン” */
+@media (max-width: 640px) {
+  html,body { overscroll-behavior-x: contain; } /* 右端スワイプ戻る等を抑制（Androidで有効） */
+  body { padding-left:12px; padding-right:max(24px, env(safe-area-inset-right)); }
+}
+
+  .board-wrap,.board{text-align:initial}
+  .cell{width:28px;height:28px;background:transparent;position:relative;cursor:pointer}
+  .stone{position:absolute;inset:0;border-radius:80%;background-position:center;background-size:135%;background-repeat:no-repeat;box-shadow:none;pointer-events:none}
+  .black{background-image:url("./black.png")} .white{background-image:url("./white.png")}
+  .lastmove::after{content:"";position:absolute;width:10px;height:10px;border:2px solid red;border-radius:50%;top:50%;left:50%;transform:translate(-50%,-50%);pointer-events:none}
+  .stone.ghost{pointer-events:none;width:35px;height:35px;opacity:.55;transform:translate(-50%,-50%);display:none;z-index:10;inset:auto}
+  .eval{margin-top:8px;font-size:14px;color:#222}
+
+.board.ended { opacity:.92; filter:grayscale(.1); }
+
+/* 楷書（教科書体系を最優先）— 端末にあれば自動で拾う */
+#title{
+  font-family:
+    /* JP: 游教科書体（iOS/macに多い） */
+    "YuKyokasho", "Yu Kyokasho", "YuKyokasho Pr6N", "Yu Kyokasho Pr6N",
+    /* JP: HG系（Windows環境で入っている場合あり） */
+    "HG教科書体", "HG正楷書体-PRO", "HGP正楷書体-PRO",
+    /* ZH: 楷体（端末により代替として表示） */
+    "STKaiti", "KaiTi", "DFKai-SB",
+    /* Fallbacks */
+    "Yu Mincho", "Hiragino Mincho ProN", "MS PMincho",
+    serif;
+  font-weight: 600;            /* 楷書らしいコントラスト */
+  letter-spacing: .05em;       /* ほんの少し字間を空けて整える */
+  line-height: 1.15;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  font-feature-settings: "palt" 1, "kern" 1; /* プロポーショナル＆カーニング */
+  white-space: nowrap;         /* 折りたくない場合は保持 */
+  margin: 0 0 8px;
+}
+
+
+
+
+</style>
+</head>
+<body>
+  <h1 id="title"><b>中盤限定囲碁</b></h1>
+
+  <div class="hud">
+    <div class="hud-row">
+      <div class="eval" id="eval">残り手数: -</div>
+      <div class="eval" id="evalFirst">優劣: （未計算）</div>
+    </div>
+    <div class="hud-row">
+      <button id="sprintBtn">中盤読み込み</button>
+      <button id="resetBtn">盤をクリア</button>
+      <label>強さ:
+        <select id="difficulty">
+          <option value="easy">弱い</option>
+          <option value="normal" selected>普通</option>
+          <option value="hard">強い</option>
+        </select>
+      </label>
+      <span class="info" id="status">黒番です。</span>
+    </div>
+  </div>
+
+<div class="board-shelf">
+  <div id="board" class="board">
+    <div id="ghost" class="stone ghost"></div>
+  </div>
+  <div id="hitboxRight" class="hitbox-right" aria-hidden="true"></div>
+</div>
+
+
+  <pre id="last" style="display:none;margin-top:12px;background:#fafafa;padding:8px;border:1px solid #eee;border-radius:8px;max-height:220px;overflow:auto;"></pre>
+
+<script>
+// --- Safe helpers for evalFirst (null-guard & auto-create) ---
+function ensureEvalFirst(){
+  let el = document.getElementById('evalFirst');
+  if (el) return el;
+  const parent = document.querySelector('.hud-row') || document.querySelector('.hud') || document.body;
+  el = document.createElement('div');
+  el.className = 'eval';
+  el.id = 'evalFirst';
+  el.textContent = '優劣: （未計算）';
+  parent.appendChild(el);
+  return el;
+}
+function setEvalFirst(text){
+  const el = ensureEvalFirst();
+  el.textContent = text;
+}
+// --- end helpers ---
+
+/* ====== 基本状態 ====== */
+const DEBUG = false;
+const N = 19, CELL = 28;
+const letters = "ABCDEFGHJKLMNOPQRST".split("");
+
+const boardEl   = document.getElementById('board');
+const ghostEl   = document.getElementById('ghost');
+const statusEl  = document.getElementById('status');
+const lastEl    = document.getElementById('last');
+const sprintBtn = document.getElementById('sprintBtn');
+const resetBtn  = document.getElementById('resetBtn');
+const evalFirstEl = document.getElementById('evalFirst') || ensureEvalFirst();
+
+// 右端ヒットボックス → 最右列(18)として処理
+const hitboxRight = document.getElementById('hitboxRight');
+hitboxRight.addEventListener('pointerdown', async (e) => {
+  e.preventDefault();
+  if (!yourTurn) return;
+
+  const rect = boardEl.getBoundingClientRect();
+  const relY = e.clientY - rect.top;
+  const y = Math.floor(relY / CELL);
+  const x = N - 1; // 最右列
+
+  if (y < 0 || y >= N) return;
+
+  // 既存セルと同じ確定フロー
+  if (ghost && ghost.x === x && ghost.y === y) {
+    clearGhost();
+    if (!place('B', x, y)) { statusEl.textContent = "そこには打てません。"; return; }
+    try { const humanMove = toCoord(x, y); window.AiMoveNLP?.reactToHumanMove?.(humanMove); } catch {}
+    moves.push(["B", toCoord(x, y)]);
+    endState.plies++; endState.movesLeft = getMovesLeft();
+    draw(); updateStatusHud(null);
+    yourTurn = false; statusEl.textContent = "AI思考中…";
+    await aiReply();
+  } else {
+    showGhost(x, y);
+  }
+}, { passive:false });
+
+
+let board = Array.from({length:N},()=>Array(N).fill(0)); // 0=空,1=黒,2=白
+let moves = [];                 // [["B","K10"],["W","D16"],...]
+let yourTurn = true;            // 黒→白…の交代
+let blackBaseline = 0;          // 初期局面読み込み直後の黒手数
+let moveLimit = 100;             // ① 残り手数
+let moveStart = 0;              // 残り手数の起点
+let firstEvalWinrate = null;    // 初手時の黒勝率（0..1）
+
+let gameOver = false;
+
+function setBoardInteractive(flag){
+  gameOver = !flag;
+  boardEl.classList.toggle('ended', !flag);
+  boardEl.style.pointerEvents = flag ? 'auto' : 'none';
+  const hb = document.getElementById('hitboxRight');
+  if (hb) hb.style.pointerEvents = flag ? 'auto' : 'none';
+}
+
+
+/* ====== 終了判定(②)の設定 ====== */
+const END_RULE = {
+  early: { scoreLeadAbs: 10.0, winrateEdge: 0.20, requireConsec: 2, minPlies: 12 },
+  onDepleted: "advantage" // ① moveLimit到達時は優劣で決定
+};
+const endState = { consec:0, plies:0, movesLeft:null };
+
+/* ====== ユーティリティ ====== */
+function toCoord(x,y){ return letters[x] + String(N-y); }
+function xyCenterPx(x,y){ return { left: x*CELL + CELL/2, top: y*CELL + CELL/2 }; }
+function neighbors(x,y){ return [[x-1,y],[x+1,y],[x,y-1],[x,y+1]].filter(([a,b])=>a>=0&&a<N&&b>=0&&b<N); }
+function getMovesLeft(){ const progressed = Math.max(0, moves.length - moveStart); return Math.max(0, moveLimit - progressed); }
+
+/* ====== 置石/取り除き ====== */
+function flood(x,y,color,vis=new Set()){
+  const key=`${x},${y}`; if(vis.has(key)) return {stones:[],libs:new Set()};
+  vis.add(key);
+  let stones=[[x,y]], libs=new Set();
+  for(const [nx,ny] of neighbors(x,y)){
+    if(board[ny][nx]===0) libs.add(`${nx},${ny}`);
+    else if(board[ny][nx]===color){
+      const r=flood(nx,ny,color,vis);
+      stones=stones.concat(r.stones); r.libs.forEach(s=>libs.add(s));
+    }
+  }
+  return {stones,libs};
+}
+function place(color,x,y){
+  if(board[y][x]!==0) return false;
+  const me=color==='B'?1:2, opp=color==='B'?2:1;
+  board[y][x]=me;
+  let captured=0;
+  for(const [nx,ny] of neighbors(x,y)){
+    if(board[ny][nx]===opp){
+      const g=flood(nx,ny,opp,new Set());
+      if(g.libs.size===0){ for(const [sx,sy] of g.stones){ board[sy][sx]=0; captured++; } }
+    }
+  }
+  const mine=flood(x,y,me,new Set());
+  if(mine.libs.size===0 && captured===0){ board[y][x]=0; return false; }
+  return true;
+}
+
+/* ====== ゴースト石 ====== */
+let ghost=null, ghostTimer=null;
+function showGhost(x,y){
+  ghost={x,y}; const p=xyCenterPx(x,y);
+  ghostEl.style.left=p.left+'px'; ghostEl.style.top=p.top+'px';
+  ghostEl.style.backgroundImage='url("./black.png")'; ghostEl.style.display='block';
+  statusEl.textContent="同じ点をもう一度タップで確定";
+  if(ghostTimer) clearTimeout(ghostTimer);
+  ghostTimer=setTimeout(()=>{ clearGhost(); statusEl.textContent="黒番です。着手してください。"; },2000);
+}
+function clearGhost(){ ghost=null; ghostEl.style.display='none'; ghostEl.style.left='-9999px'; ghostEl.style.top='-9999px'; if(ghostTimer){clearTimeout(ghostTimer);ghostTimer=null;} }
+
+/* ====== HUD ====== */
+function renderFirstEvalFromStorage(){
+  try{
+    const s=localStorage.getItem('firstEval'); if(!s){ firstEvalWinrate=null; return; }
+    const r=JSON.parse(s); firstEvalWinrate=(r.blackWinPct??0)/100;
+  }catch{ firstEvalWinrate=null; }
+}
+function updateStatusHud(currentBlackWin=null){
+  const remaining=getMovesLeft();
+  document.getElementById("eval").textContent=`残り手数: ${remaining}`;
+  let advText='（未計算）';
+  if(firstEvalWinrate!==null && currentBlackWin!==null){
+    const diffPct=(currentBlackWin-firstEvalWinrate)*100;
+    const sign=diffPct>=0?'+':'';
+    advText=`${sign}${diffPct.toFixed(1)}%`;
+  }
+  setEvalFirst(`優劣: ${advText}`);
+}
+
+/* ====== 描画 ====== */
+function draw(){
+  boardEl.innerHTML=""; boardEl.appendChild(ghostEl);
+  const last=moves[moves.length-1]||null;
+  let lastX=-1,lastY=-1;
+  if(last){ lastX=letters.indexOf(last[1][0]); lastY=N-parseInt(last[1].slice(1),10); }
+  for(let y=0;y<N;y++) for(let x=0;x<N;x++){
+    const cell=document.createElement('div'); cell.className='cell';
+    const v=board[y][x];
+    if(v){
+      const st=document.createElement('div'); st.className='stone '+(v===1?'black':'white');
+      if(x===lastX&&y===lastY) st.classList.add('lastmove'); cell.appendChild(st);
+    }
+    cell.addEventListener('pointerdown', async (e)=>{
+      if(e&&e.pointerType&&e.pointerType!=='mouse') e.preventDefault();
+      
+  if (gameOver) { statusEl.textContent="終了しました。「盤をクリア」または「中盤読み込み」を押してください。"; return; }
+  if(!yourTurn) return;
+
+      if(ghost && ghost.x===x && ghost.y===y){
+        clearGhost();
+        if(!place('B',x,y)){ statusEl.textContent="そこには打てません。"; return; }
+        try{ const humanMove=toCoord(x,y); window.AiMoveNLP?.reactToHumanMove?.(humanMove); }catch{}
+        moves.push(["B",toCoord(x,y)]);
+        endState.plies++; endState.movesLeft=getMovesLeft();
+        draw(); updateStatusHud(null);
+        yourTurn=false; statusEl.textContent="AI思考中…";
+        await aiReply();
+      }else{
+        showGhost(x,y);
+      }
+    }, {passive:false});
+    boardEl.appendChild(cell);
+  }
+}
+
+/* ====== KataGo応答 → 早期終了/残り手数終了 判定 ====== */
+const REPORT_AS='PLAYER_TO_MOVE';
+function readAdvantage(kmsg){
+  const root=kmsg?.rootInfo||kmsg; if(!root) return {mode:null};
+  const isWhiteToMove = root.currentPlayer==='W';
+  if(typeof root.scoreLead==="number"){
+    let lead=root.scoreLead; if(REPORT_AS==='PLAYER_TO_MOVE' && isWhiteToMove) lead=-lead;
+    return {mode:"score", value:lead, abs:Math.abs(lead), leader:lead>0?'B':(lead<0?'W':null)};
+  }
+  if(typeof root.winrate==="number"){
+    let bw = root.winrate; if(REPORT_AS==='PLAYER_TO_MOVE' && isWhiteToMove) bw=1-bw;
+    const val=bw-0.5;
+    return {mode:"winrate", value:val, abs:Math.abs(val), leader:val>0?'B':(val<0?'W':null)};
+  }
+  return {mode:null};
+}
+function checkEarlyEnd(kmsg){
+  const a=readAdvantage(kmsg); if(!a.mode) return false;
+  if(endState.plies < END_RULE.early.minPlies) return false;
+  let over=false;
+  if(a.mode==="score") over = a.abs >= END_RULE.early.scoreLeadAbs;
+  else over = a.abs >= END_RULE.early.winrateEdge;
+  if(over){ endState.consec++; if(endState.consec>=END_RULE.early.requireConsec){ return {winner:a.leader, reason:a.mode==="score"?"scoreLead":"winrate", value:a.value}; } }
+  else endState.consec=0;
+  return false;
+}
+function checkDepleted(kmsg){
+  if(END_RULE.onDepleted!=="advantage") return false;
+  if(getMovesLeft()!==0) return false;
+  const a=readAdvantage(kmsg); if(!a.mode||!a.leader) return {winner:null, reason:"draw_or_unknown"};
+  return {winner:a.leader, reason:a.mode==="score"?"scoreLead":"winrate", value:a.value};
+}
+function finishGame(verdict){
+  const who = verdict.winner==='B'?"黒":(verdict.winner==='W'?"白":"（不明）");
+  const label = verdict.reason==='scoreLead'
+    ? `点差 ${verdict.value?.toFixed?.(1)}`
+    : verdict.reason==='winrate'
+    ? `勝率差 ${(Math.abs((verdict.value||0))*100).toFixed(1)}%` : "優劣不明";
+  statusEl.textContent=`終了: ${who} の勝ち（${label}）`;
+
+  // 盤面だけ無効化。ボタンは使える（「中盤読み込み」「盤をクリア」など）
+  setBoardInteractive(false);
+  sprintBtn.disabled = false;
+  resetBtn.disabled  = false;
+
+
+(el=>el.disabled=true);
+}
+
+/* ====== AI応答 ====== */
+async function aiReply(){
+  try{
+    const diff=document.getElementById('difficulty').value||'normal';
+    const visits = diff==="easy" ? 2 : diff==="hard" ? 128 : 64;  // easy=2, normal=64, hard=128
+ const payload={rules:"japanese", komi:6.5, boardXSize:N, boardYSize:N, maxVisits:visits, moves};
+    const resp=await fetch(`/api/analyze?engine=${encodeURIComponent(diff)}`,{
+      method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)
+    });
+    const data=await resp.json();
+    if(DEBUG){ lastEl.style.display='block'; lastEl.textContent=JSON.stringify(data.katago,null,2); }
+
+    // 黒視点で勝率・点差を取得
+    let blackWin=null;
+    const root=data?.katago?.rootInfo;
+    if(root){
+      const isWhiteToMove = root.currentPlayer==='W';
+      blackWin = root.winrate; if(REPORT_AS==='PLAYER_TO_MOVE' && isWhiteToMove) blackWin=1-blackWin;
+
+      // 初手評価の保存（読み込み後あなたの最初の黒手）
+      const blackCount = moves.filter(([bw])=>bw==="B").length;
+      const isUsersFirstBlack = blackCount === blackBaseline + 1;
+      if(isUsersFirstBlack && !localStorage.getItem('firstEval')){
+        const lastBlack = [...moves].reverse().find(m=>m[0]==="B")?.[1] ?? null;
+        const rec={ ts:Date.now(), move:lastBlack, blackWinPct:blackWin*100, whiteWinPct:(1-blackWin)*100, scoreLead: (readAdvantage(root).value??null) };
+        localStorage.setItem('firstEval', JSON.stringify(rec));
+        renderFirstEvalFromStorage();
+        firstEvalWinrate = blackWin;
+      }
+    }
+
+    updateStatusHud(blackWin);
+
+    // ② 早期終了 → ① 残り手数=0
+    const early = checkEarlyEnd(data.katago); if(early){ finishGame(early); return; }
+    const dep   = checkDepleted(data.katago); if(dep){ finishGame(dep); return; }
+
+    // AIの着手
+    const mv=data.bestMove;
+    if(!mv){ statusEl.textContent="AIの手が得られませんでした。"; yourTurn=true; return; }
+    const x=letters.indexOf(mv[0]); const y=N-parseInt(mv.slice(1),10);
+    if(x<0||y<0||x>=N||y>=N){ statusEl.textContent=`不正な手: ${mv}`; yourTurn=true; return; }
+    if(!place('W',x,y)){ statusEl.textContent=`AI手(${mv})が置けません。`; yourTurn=true; draw(); return; }
+    moves.push(["W",mv]);
+    endState.plies++; endState.movesLeft=getMovesLeft();
+    draw(); updateStatusHud(blackWin);
+
+    try{ window.AiMoveNLP?.describe?.({bestMove:mv, katago:data.katago, moves}); }catch{}
+    statusEl.textContent="黒番です。"; yourTurn=true;
+  }catch(e){
+    statusEl.textContent="通信エラー: "+e; yourTurn=true;
+  }
+}
+
+/* ====== ランダム初期局面の適用 ====== */
+function applyMoves(mvList){
+  clearGhost();
+  board = Array.from({length:N},()=>Array(N).fill(0));
+  moves=[]; yourTurn=true;
+  for(const [bw,coord] of mvList){
+    const x=letters.indexOf(coord[0]); const y=N-parseInt(coord.slice(1),10);
+    if(x<0||y<0||x>=N||y>=N) continue;
+    place(bw,x,y); moves.push([bw,coord]);
+  }
+  draw();
+  const blackToMove=(moves.length%2===0);
+  yourTurn=blackToMove;
+  statusEl.textContent = blackToMove ? "黒番です（ランダム初期盤面）。" : "白番です。AIの着手を待っています…";
+  if(!blackToMove) aiReply();
+
+  blackBaseline = moves.filter(([bw])=>bw==="B").length;
+  localStorage.removeItem('firstEval'); renderFirstEvalFromStorage(); firstEvalWinrate=null;
+
+  moveStart = moves.length; // ←ここを基準とする
+  updateStatusHud(null);
+}
+
+/* ====== UIイベント ====== */
+sprintBtn.addEventListener("click", async ()=>{
+  statusEl.textContent="初期局面を取得中…";
+  const resp=await fetch("/api/sprint/random"); const data=await resp.json();
+  if(!data.ok){ statusEl.textContent="初期局面取得失敗: "+(data.error||""); return; }
+  applyMoves(data.moves||[]);
+  if(DEBUG){ lastEl.style.display='block'; lastEl.textContent="Loaded recId: "+(data.recId??"(unknown)")+"\n"+JSON.stringify({moves:data.moves},null,2); }
+  moveLimit=30; updateStatusHud(null);
+});
+resetBtn.addEventListener('click', ()=>{
+setBoardInteractive(true);
+  firstEvalWinrate=null; updateStatusHud(null); clearGhost();
+  board=Array.from({length:N},()=>Array(N).fill(0)); moves=[]; yourTurn=true; moveStart=moves.length;
+  lastEl.textContent=""; statusEl.textContent="黒番です。着手してください。";
+  blackBaseline=0; localStorage.removeItem('firstEval'); renderFirstEvalFromStorage(); draw();
+});
+
+/* ====== 初期化 ====== */
+localStorage.removeItem('firstEval'); renderFirstEvalFromStorage(); updateStatusHud(null); draw();
+</script>
+<script src="./aiComment.js"></script>
+</body>
+</html>

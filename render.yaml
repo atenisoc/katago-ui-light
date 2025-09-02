@@ -1,0 +1,10 @@
+﻿services:
+  - type: web
+    name: katago-ui-light
+    env: docker
+    autoDeploy: true
+    plan: starter
+    healthCheckPath: /healthz
+    envVars:
+      - key: NODE_ENV
+        value: production

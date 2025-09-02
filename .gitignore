@@ -1,0 +1,13 @@
+*.bin.gz
+*.txt.gz
+*.zip
+!engines/
+!engines/**
+
+# ignore huge SGF datasets
+*.sgf
+data/**/*.sgf
+
+# ensure engines are tracked
+!engines/
+!engines/**

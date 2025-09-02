@@ -1,0 +1,317 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>KataGo 最小対局UI (黒=あなた / 白=AI)</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin:16px; }
+  .hud { margin:8px 0; display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+  button { padding:8px 12px; border-radius:8px; border:1px solid #ccc; background:#fff; cursor:pointer; }
+  .info { font-size:14px; color:#333; }
+
+  /* 盤は木目画像に置換（格子線＆星は画像側） */
+  .board{
+    position:relative;
+    display:grid;
+    grid-template-columns:repeat(19,28px);
+    grid-template-rows:repeat(19,28px);
+    width:calc(19 * 28px);
+    height:calc(19 * 28px);
+    background:url("./board_19x19_3.png") no-repeat center/cover;
+    background-size: 101% 101%;
+  }
+  .cell{
+    width:28px; height:28px;
+    background:transparent;   /* 画像を透過させる */
+    position:relative;
+    cursor:pointer;
+  }
+
+  /* 石は画像で描画（余白は inset で微調整） */
+  .stone{
+    position:absolute;
+    inset:0px;                /* 2〜4で微調整可 */
+    border-radius:80%;
+    background-position:center;
+    background-size:135%;
+    background-repeat:no-repeat;
+    box-shadow:none;
+    pointer-events:none;      /* クリックはセルに通す */
+  }
+  .black{ background-image:url("./black.png"); }
+  .white{ background-image:url("./white.png"); }
+
+  /* 最終手ハイライト（差分だけ見せる） */
+  .lastmove::after{
+    content:"";
+    position:absolute;
+    width:10px; height:10px;
+    border:2px solid red;
+    border-radius:50%;
+    top:50%; left:50%;
+    transform:translate(-50%,-50%);
+    pointer-events:none;
+  }
+
+  .eval { margin-top: 8px; font-size: 14px; color: #222; }
+</style>
+</head>
+<body>
+  <h2>KataGo 最小対局UI <small>(黒=あなた / 白=AI)</small></h2>
+
+  <div class="hud">
+    <div class="eval" id="eval">評価値: -</div>
+    <div class="eval" id="evalFirst">初手評価: （未保存）</div>
+
+    <button id="sprintBtn">スプリント開始（ランダム）</button>
+    <button id="resetBtn">盤をクリア</button>
+    <label>訪問回数: <input id="maxVisits" type="number" min="1" step="1" value="2" style="width:60px"></label>
+    <label>強さ:
+  <select id="difficulty">
+    <option value="easy"> 弱い </option>
+    <option value="normal" selected> 普通 </option>
+    <option value="hard"> 強い </option>
+  </select>
+</label>
+
+    <span class="info" id="status">黒番です。セルをクリックして着手してください。</span>
+  </div>
+
+  <div id="board" class="board"></div>
+  <pre id="last" style="margin-top:12px; background:#fafafa; padding:8px; border:1px solid #eee; border-radius:8px; max-height:220px; overflow:auto;"></pre>
+
+<script>
+const N = 19;
+const boardEl = document.getElementById('board');
+const statusEl = document.getElementById('status');
+const lastEl = document.getElementById('last');
+const maxVisitsEl = document.getElementById('maxVisits');
+const resetBtn = document.getElementById('resetBtn');
+const sprintBtn = document.getElementById('sprintBtn');
+
+ // エンジンが「手番視点」で返してきても、UIは常に“黒視点”に正規化する
+ // 'BLACK' | 'WHITE' | 'PLAYER_TO_MOVE'
+ const REPORT_AS = 'PLAYER_TO_MOVE';
+const evalFirstEl = document.getElementById('evalFirst');
+
+function renderFirstEvalFromStorage(){
+  try{
+    const s = localStorage.getItem('firstEval');
+    if(!s){ evalFirstEl.textContent = '初手評価: （未保存）'; return; }
+    const r = JSON.parse(s);
+    const when = new Date(r.ts).toLocaleString();
+    evalFirstEl.textContent =
+      `初手評価: 黒 ${r.blackWinPct.toFixed(1)}% / 白 ${r.whiteWinPct.toFixed(1)}% （黒の平均リード ${r.scoreLead.toFixed(1)}目, 手=${r.move}, ${when}）`;
+  }catch{
+    evalFirstEl.textContent = '初手評価: （未保存）';
+  }
+}
+
+// 0=空, 1=黒, 2=白
+let board = Array.from({length:N}, () => Array(N).fill(0));
+let moves = []; // [["B","K10"],["W","D16"],...]
+let blackBaseline = 0;   // ← ロード時点の黒手数を保持
+let yourTurn = true; // 黒から
+
+// 座標（Iを飛ばす）
+const letters = "ABCDEFGHJKLMNOPQRST".split("");
+function toCoord(x,y){ const col=letters[x]; const row=(N-y).toString(); return col+row; }
+
+function neighbors(x,y){ return [[x-1,y],[x+1,y],[x,y-1],[x,y+1]].filter(([a,b])=>a>=0&&a<N&&b>=0&&b<N); }
+function flood(x,y,color,vis=new Set()){
+  const key=`${x},${y}`; if(vis.has(key)) return {stones:[],libs:new Set()};
+  vis.add(key);
+  let stones=[[x,y]], libs=new Set();
+  for(const [nx,ny] of neighbors(x,y)){
+    if(board[ny][nx]===0) libs.add(`${nx},${ny}`);
+    else if(board[ny][nx]===color){
+      const r=flood(nx,ny,color,vis);
+      stones = stones.concat(r.stones);
+      r.libs.forEach(s=>libs.add(s));
+    }
+  }
+  return {stones,libs};
+}
+function place(color,x,y){
+  if(board[y][x]!==0) return false;
+  const me = color==='B'?1:2;
+  const opp= color==='B'?2:1;
+  board[y][x]=me;
+
+  // アゲハマ
+  let captured=0;
+  for(const [nx,ny] of neighbors(x,y)){
+    if(board[ny][nx]===opp){
+      const g=flood(nx,ny,opp,new Set());
+      if(g.libs.size===0){
+        for(const [sx,sy] of g.stones){ board[sy][sx]=0; captured++; }
+      }
+    }
+  }
+  // 自殺禁止（直前取りで助かっていればOK）
+  const mine=flood(x,y,me,new Set());
+  if(mine.libs.size===0 && captured===0){ board[y][x]=0; return false; }
+  return true;
+}
+
+/* 最後の一手だけマーク */
+function draw(){
+  boardEl.innerHTML="";
+  const last = moves[moves.length-1];
+  let lastX=-1,lastY=-1;
+  if(last){
+    const colLetter=last[1][0];
+    const rowNum=parseInt(last[1].slice(1),10);
+    lastX=letters.indexOf(colLetter);
+    lastY=N-rowNum;
+  }
+  for(let y=0;y<N;y++) for(let x=0;x<N;x++){
+    const cell=document.createElement('div');
+    cell.className='cell';
+    const v=board[y][x];
+    if(v){
+      const st=document.createElement('div');
+      st.className='stone ' + (v===1?'black':'white');
+      if(x===lastX && y===lastY) st.classList.add('lastmove');
+      cell.appendChild(st);
+    }
+    cell.addEventListener('click', async ()=>{
+      if(!yourTurn) return;
+      if(!place('B',x,y)){ statusEl.textContent="そこには打てません。別の点を。"; return; }
+      moves.push(["B", toCoord(x,y)]);
+      yourTurn=false;
+      statusEl.textContent="AI思考中…";
+      draw();
+      await aiReply();
+    });
+    boardEl.appendChild(cell);
+  }
+}
+
+async function aiReply(){
+  try{
+    const maxVisits = parseInt(maxVisitsEl.value || "2", 10);
+
+    const payload = {
+      rules:"japanese", komi:6.5,
+      boardXSize:N, boardYSize:N,
+      maxVisits, moves
+    };
+    const resp = await fetch("/api/analyze", {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify(payload),
+    });
+
+    const data = await resp.json();
+    lastEl.textContent = JSON.stringify(data.katago, null, 2);
+
+    const root = data?.katago?.rootInfo;
+    if (root) {
+
+      // === 常に“黒視点”へ正規化 ===
+      const isWhiteToMove = root.currentPlayer === 'W';
+      // 勝率（0..1）：手番視点→黒視点へ変換
+      let blackWin = root.winrate;
+      if (REPORT_AS === 'WHITE') blackWin = 1 - blackWin;
+      if (REPORT_AS === 'PLAYER_TO_MOVE' && isWhiteToMove) blackWin = 1 - blackWin;
+      const whiteWin = 1 - blackWin;
+      // リード（目数）：手番視点→黒視点へ変換
+      let leadBlack = (root.scoreLead ?? 0);
+      if (REPORT_AS === 'PLAYER_TO_MOVE' && isWhiteToMove) leadBlack = -leadBlack;
+
+      document.getElementById("eval").textContent =
+        `黒: ${(blackWin*100).toFixed(1)}%　白: ${(whiteWin*100).toFixed(1)}%　（黒の平均リード: ${leadBlack.toFixed(1)}目）`;
+
+      // --- 初手評価の保存（このセッションで最初のあなたの黒手）---
+      const blackCount = moves.filter(([bw]) => bw === "B").length;
+      const isUsersFirstBlack = blackCount === blackBaseline + 1;
+      if (isUsersFirstBlack && !localStorage.getItem('firstEval')) {
+        const lastBlackMove = [...moves].reverse().find(m => m[0] === "B")?.[1] ?? null;
+        const rec = {
+          ts: Date.now(),
+          move: lastBlackMove,
+          blackWinPct: blackWin * 100,
+          whiteWinPct: whiteWin * 100,
+          scoreLead: leadBlack
+        };
+        localStorage.setItem('firstEval', JSON.stringify(rec));
+        renderFirstEvalFromStorage();
+      }
+    } else {
+      document.getElementById("eval").textContent = "評価値: 取得できませんでした";
+    }
+
+    const mv = data.bestMove;
+    if(!mv){ statusEl.textContent="AIの手が得られませんでした。"; yourTurn=true; return; }
+    const x = letters.indexOf(mv[0]);
+    const y = N - parseInt(mv.slice(1),10);
+    if(x<0||y<0||x>=N||y>=N){ statusEl.textContent=`不正な手: ${mv}`; yourTurn=true; return; }
+    if(!place('W',x,y)){ statusEl.textContent=`AI手(${mv})がUIで置けませんでした。`; yourTurn=true; draw(); return; }
+    moves.push(["W", mv]);
+    draw();
+    statusEl.textContent="黒番です。";
+    yourTurn=true;
+  }catch(e){
+    statusEl.textContent="通信エラー: "+e;
+    yourTurn=true;
+  }
+}
+
+resetBtn.addEventListener('click', ()=>{
+  board = Array.from({length:N},()=>Array(N).fill(0));
+  moves=[]; yourTurn=true;
+  lastEl.textContent="";
+  statusEl.textContent="黒番です。セルをクリックして着手してください。";
+  blackBaseline = 0; // クリア時は0から
+  localStorage.removeItem('firstEval');
+  renderFirstEvalFromStorage();
+  draw();
+});
+
+// ランダム初期局面
+function applyMoves(mvList){
+  board = Array.from({length:N},()=>Array(N).fill(0));
+  moves=[]; yourTurn=true;
+  for(const [bw,coord] of mvList){
+    const x=letters.indexOf(coord[0]);
+    const y=N - parseInt(coord.slice(1),10);
+    if(x<0||y<0||x>=N||y>=N) continue;
+    place(bw,x,y);
+    moves.push([bw,coord]);
+  }
+  draw();
+  const blackToMove = (moves.length%2===0);
+  yourTurn = blackToMove;
+  if(blackToMove){
+    statusEl.textContent="黒番です（ランダム初期盤面）。";
+  }else{
+    statusEl.textContent="白番です。AIの着手を待っています…";
+    aiReply();
+  }
+
+  // 読み込み直後の黒手数を基準にする
+  blackBaseline = moves.filter(([bw]) => bw === "B").length;
+
+  // 初手評価は毎回未保存から
+  localStorage.removeItem('firstEval');
+  renderFirstEvalFromStorage();
+}
+
+sprintBtn.addEventListener("click", async ()=>{
+  statusEl.textContent="初期局面を取得中…";
+  const resp = await fetch("/api/sprint/random");
+  const data = await resp.json();
+  if(!data.ok){ statusEl.textContent="初期局面取得失敗: "+(data.error||""); return; }
+  applyMoves(data.moves||[]);
+  lastEl.textContent="Loaded recId: "+(data.recId??"(unknown)")+"\n"+JSON.stringify({moves:data.moves},null,2);
+});
+
+// 初期描画（ロード時は必ず未保存から）
+localStorage.removeItem('firstEval');
+renderFirstEvalFromStorage();
+draw();
+</script>
+</body>
+</html>

@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<title>KataGo Sprint UI (80-move snapshots)</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  body { font-family: system-ui, sans-serif; margin: 16px; }
+  #board { border: 1px solid #999; width: 608px; height: 608px; position: relative; }
+  .stone { position: absolute; width: 32px; height: 32px; border-radius: 50%; }
+  .black { background: #000; border: 1px solid #000; }
+  .white { background: transparent; border: 2px solid #000; }
+  #hud { margin-top: 12px; display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+</style>
+</head>
+<body>
+<h2>80手スプリント（ランダム初期局面）</h2>
+<div id="board"></div>
+<div id="hud">
+  <button id="sprintBtn">スプリント開始（ランダム）</button>
+  <label>ID: <input id="sprintId" placeholder="game_000042.sgf" /></label>
+  <button id="sprintByIdBtn">IDで開始</button>
+  <span id="status"></span>
+</div>
+<script>
+const N = 19, CELL = 32, PAD = 0;
+let board = Array.from({length:N}, () => Array(N).fill(0));
+let yourTurn = true;
+let komi = 6.5;
+const boardEl = document.getElementById("board");
+const statusEl = document.getElementById("status");
+
+function drawGrid() {
+  const ctx = document.createElement("canvas");
+  ctx.width = N*CELL; ctx.height = N*CELL;
+  const g = ctx.getContext("2d");
+  g.strokeStyle = "#777"; g.lineWidth = 1;
+  for (let i=0;i<N;i++) {
+    g.beginPath(); g.moveTo(0,i*CELL+CELL/2); g.lineTo(N*CELL, i*CELL+CELL/2); g.stroke();
+    g.beginPath(); g.moveTo(i*CELL+CELL/2,0); g.lineTo(i*CELL+CELL/2, N*CELL); g.stroke();
+  }
+  // star points
+  [3,9,15].forEach(r => [3,9,15].forEach(c => {
+    g.beginPath(); g.arc(c*CELL+CELL/2, r*CELL+CELL/2, 3, 0, Math.PI*2); g.fillStyle="#333"; g.fill();
+  }));
+  boardEl.style.backgroundImage = "url(" + ctx.toDataURL() + ")";
+}
+drawGrid();
+
+function clearStones() { boardEl.querySelectorAll(".stone").forEach(el => el.remove()); }
+function putStone(x,y,color){
+  const el = document.createElement("div");
+  el.className = "stone " + (color===1?"black":"white");
+  el.style.left = (x*CELL) + "px";
+  el.style.top  = (y*CELL) + "px";
+  boardEl.appendChild(el);
+}
+function draw(){
+  clearStones();
+  for (let y=0;y<N;y++) for (let x=0;x<N;x++) {
+    if (board[y][x]===1) putStone(x,y,1);
+    else if (board[y][x]===2) putStone(x,y,2);
+  }
+}
+
+function applyStones(stones){
+  board = Array.from({length:N}, () => Array(N).fill(0));
+  stones.forEach(s => { board[s.y][s.x] = (s.color==='B')?1:2; });
+  draw();
+}
+
+async function startSprintRandom(){
+  const r = await fetch("/api/sprint/random");
+  const d = await r.json();
+  if (!d.ok){ statusEl.textContent="読み込み失敗"; return; }
+  applyStones(d.stones);
+  komi = d.komi ?? 6.5;
+  yourTurn = (d.player_to_move === "B");
+  statusEl.textContent = yourTurn ? "黒番：打ってください" : "白番：AI思考中…（分析API統合が必要）";
+}
+async function startSprintById(){
+  const id = document.getElementById("sprintId").value.trim();
+  if (!id) return;
+  const r = await fetch("/api/sprint/byId?id="+encodeURIComponent(id));
+  const d = await r.json();
+  if (!d.ok){ statusEl.textContent="ID読み込み失敗"; return; }
+  applyStones(d.stones);
+  komi = d.komi ?? 6.5;
+  yourTurn = (d.player_to_move === "B");
+  statusEl.textContent = yourTurn ? "黒番：打ってください" : "白番：AI思考中…（分析API統合が必要）";
+}
+document.getElementById("sprintBtn").addEventListener("click", startSprintRandom);
+document.getElementById("sprintByIdBtn").addEventListener("click", startSprintById);
+</script>
+</body>
+</html>

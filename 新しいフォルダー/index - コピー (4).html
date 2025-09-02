@@ -1,0 +1,230 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<title>KataGo UI + Sprint (80手スナップショット)</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  body { font-family: system-ui, sans-serif; margin: 16px; }
+  h2 { margin: 0 0 8px; }
+  .wrap { display:flex; gap:20px; flex-wrap:wrap; }
+  #board { border: 1px solid #999; width: 608px; height: 608px; position: relative; }
+  .stone { position: absolute; width: 28px; height: 28px; border-radius: 50%; transform: translate(-50%, -50%); }
+  .black { background: #000; border: 1px solid #000; }
+  .white { background: transparent; border: 2px solid #000; }
+  .hud { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-top:8px; }
+  .info { min-width: 280px; }
+  .last-move { position:absolute; width: 16px; height: 16px; border-radius: 50%;
+               pointer-events:none; box-shadow: 0 0 0 2px rgba(0,0,0,0.65);
+               background: rgba(255,255,255,0.0); transform: translate(-50%, -50%); z-index: 5; }
+  .last-move.dot { width: 6px; height: 6px; box-shadow: none; background: rgba(0,0,0,0.9); }
+  input[type="number"] { width: 64px; }
+</style>
+</head>
+<body>
+  <h2>80手スプリント（ランダム初期局面）</h2>
+  <div class="wrap">
+    <div id="board"></div>
+    <div>
+      <div class="hud">
+        <button id="resetBtn">盤をクリア</button>
+        <label>時間上限(s): <input id="maxTime" type="number" value="1.0" step="0.1" min="0.1"></label>
+        <button id="sprintBtn">スプリント開始（ランダム）</button>
+        <label>ID: <input id="sprintId" type="text" placeholder="game_000042.sgf" style="width:160px"></label>
+        <button id="sprintByIdBtn">IDで開始</button>
+        <label><input type="checkbox" id="toggleLast" checked> 最終着手を表示</label>
+      </div>
+      <div class="hud">
+        <span class="info" id="status">黒番です。セルをクリックして着手してください。</span>
+      </div>
+    </div>
+  </div>
+
+<script>
+// --- Board setup ---
+const N = 19;
+const CELL = 32;
+let komi = 6.5;
+let yourTurn = true;             // true: 黒の手番 (ユーザー), false: 白の手番 (AI)
+let showLast = true;
+let lastMove = null;             // {x,y,color:'B'|'W'} or null
+let board = Array.from({length:N}, () => Array(N).fill(0));  // 0 empty, 1 black, 2 white
+let moves = []; // [{player:'B'|'W', loc:'aa'} ...]
+
+const boardEl = document.getElementById("board");
+const statusEl = document.getElementById("status");
+const maxTimeEl = document.getElementById("maxTime");
+
+function drawGrid() {
+  const cvs = document.createElement("canvas");
+  cvs.width = N*CELL; cvs.height = N*CELL;
+  const g = cvs.getContext("2d");
+  g.strokeStyle = "#777"; g.lineWidth = 1;
+  // grid
+  for (let i=0;i<N;i++) {
+    g.beginPath(); g.moveTo(CELL/2, i*CELL+CELL/2); g.lineTo(N*CELL-CELL/2, i*CELL+CELL/2); g.stroke();
+    g.beginPath(); g.moveTo(i*CELL+CELL/2, CELL/2); g.lineTo(i*CELL+CELL/2, N*CELL-CELL/2); g.stroke();
+  }
+  // star points
+  [3,9,15].forEach(r => [3,9,15].forEach(c => {
+    g.beginPath();
+    g.arc(c*CELL+CELL/2, r*CELL+CELL/2, 3, 0, Math.PI*2);
+    g.fillStyle="#333";
+    g.fill();
+  }));
+  boardEl.style.backgroundImage = "url(" + cvs.toDataURL() + ")";
+  boardEl.style.backgroundSize = (N*CELL)+"px "+(N*CELL)+"px";
+}
+drawGrid();
+
+function clearStones() { boardEl.querySelectorAll(".stone").forEach(el => el.remove()); }
+
+function putStone(x,y,color){
+  const el = document.createElement("div");
+  el.className = "stone " + (color===1?"black":"white");
+  el.style.left = (x*CELL + CELL/2) + "px";
+  el.style.top  = (y*CELL + CELL/2) + "px";
+  boardEl.appendChild(el);
+}
+
+function placeLastMarker() {
+  if (!showLast || !lastMove) return;
+  // remove existing
+  boardEl.querySelectorAll(".last-move").forEach(el => el.remove());
+  const xpx = lastMove.x * CELL + CELL/2;
+  const ypx = lastMove.y * CELL + CELL/2;
+  const ring = document.createElement("div");
+  ring.className = "last-move";
+  ring.style.left = xpx + "px"; ring.style.top = ypx + "px";
+  boardEl.appendChild(ring);
+  const dot = document.createElement("div");
+  dot.className = "last-move dot";
+  dot.style.left = xpx + "px"; dot.style.top = ypx + "px";
+  boardEl.appendChild(dot);
+}
+
+function draw(){
+  clearStones();
+  for (let y=0;y<N;y++) for (let x=0;x<N;x++) {
+    if (board[y][x]===1) putStone(x,y,1);
+    else if (board[y][x]===2) putStone(x,y,2);
+  }
+  placeLastMarker();
+}
+
+// --- Utils ---
+function xyToSgf(x,y) { return String.fromCharCode(97+x) + String.fromCharCode(97+y); }
+function isEmpty(x,y){ return x>=0&&x<N&&y>=0&&y<N && board[y][x]===0; }
+
+// --- User play (黒) ---
+boardEl.addEventListener("click", async (e) => {
+  const rect = boardEl.getBoundingClientRect();
+  const x = Math.floor((e.clientX - rect.left) / CELL);
+  const y = Math.floor((e.clientY - rect.top) / CELL);
+  if (!yourTurn) return;
+  if (!isEmpty(x,y)) return;
+  // place black
+  board[y][x] = 1;
+  lastMove = {x,y,color:'B'};
+  moves.push({player:"B", loc: xyToSgf(x,y)});
+  yourTurn = false;
+  draw();
+  statusEl.textContent = "白番です。AI思考中…";
+  await aiReplySafe();
+});
+
+// --- Reset ---
+document.getElementById("resetBtn").addEventListener("click", () => {
+  board = Array.from({length:N}, () => Array(N).fill(0));
+  moves = [];
+  yourTurn = true;
+  lastMove = null;
+  draw();
+  statusEl.textContent = "黒番です。セルをクリックして着手してください。";
+});
+
+// --- Toggle last move ---
+document.getElementById("toggleLast").addEventListener("change", (e) => {
+  showLast = e.target.checked;
+  draw();
+});
+
+// --- Sprint: apply stones and last move ---
+function applyStones(stones, last_move) {
+  board = Array.from({length:N}, () => Array(N).fill(0));
+  for (const s of stones) {
+    board[s.y][s.x] = (s.color === 'B') ? 1 : 2;
+  }
+  lastMove = (last_move && Number.isInteger(last_move.x) && Number.isInteger(last_move.y)) ? last_move : null;
+  moves = []; // 初期局面から開始
+  draw();
+}
+
+// --- Sprint: random ---
+async function startSprintRandom() {
+  const resp = await fetch("/api/sprint/random");
+  const data = await resp.json();
+  if (!data.ok) { statusEl.textContent = "スプリント読み込み失敗"; return; }
+  applyStones(data.stones, data.last_move);
+  komi = (data.komi ?? 6.5);
+  yourTurn = (data.player_to_move === "B");
+  statusEl.textContent = yourTurn ? "黒番です。打ってください。" : "白番です。AI思考中…";
+  if (!yourTurn) await aiReplySafe();
+}
+
+// --- Sprint: by id ---
+async function startSprintById(id) {
+  const resp = await fetch("/api/sprint/byId?id="+encodeURIComponent(id));
+  const data = await resp.json();
+  if (!data.ok) { statusEl.textContent = "ID読み込み失敗"; return; }
+  applyStones(data.stones, data.last_move);
+  komi = (data.komi ?? 6.5);
+  yourTurn = (data.player_to_move === "B");
+  statusEl.textContent = yourTurn ? "黒番です。打ってください。" : "白番です。AI思考中…";
+  if (!yourTurn) await aiReplySafe();
+}
+
+document.getElementById("sprintBtn").addEventListener("click", startSprintRandom);
+document.getElementById("sprintByIdBtn").addEventListener("click", () => {
+  const id = document.getElementById("sprintId").value.trim();
+  if (id) startSprintById(id);
+});
+
+// --- AI reply bridge ---
+// If page already defines aiReply(), use it. Otherwise provide a minimal fallback.
+async function aiReplySafe(){
+  if (typeof aiReply === "function") {
+    return aiReply(); // 既存の実装を使用（/api/analyze に合わせてあるはず）
+  }
+  // Fallback: call /api/analyze with a minimal payload used earlier in this chat
+  try {
+    const body = { moves, rules: "japanese", komi, maxTime: Number(maxTimeEl.value || 1.0) };
+    const resp = await fetch("/api/analyze", {
+      method: "POST",
+      headers: {"Content-Type":"application/json"},
+      body: JSON.stringify(body)
+    });
+    const data = await resp.json();
+    // 期待する返却例: { ok:true, move:{player:"W", loc:"pd"} }
+    if (data && data.move && data.move.loc) {
+      const loc = data.move.loc;
+      const x = loc.charCodeAt(0)-97, y = loc.charCodeAt(1)-97;
+      if (isEmpty(x,y)) {
+        board[y][x] = 2;
+        lastMove = {x,y,color:'W'};
+        moves.push({player:"W", loc});
+      }
+      yourTurn = true;
+      draw();
+      statusEl.textContent = "黒番です。セルをクリックして着手してください。";
+    } else {
+      statusEl.textContent = "AI応手の取得に失敗しました";
+    }
+  } catch (e) {
+    console.error(e);
+    statusEl.textContent = "AI応手エラー: " + e.message;
+  }
+}
+</script>
+</body>
+</html>

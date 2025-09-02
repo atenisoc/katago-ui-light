@@ -1,0 +1,234 @@
+/**
+ * server.js (multi-engine)
+ * - Static hosting for index.html 等
+ * - 3つの KataGo analysis エンジンを常駐 (easy/normal/hard)
+ * - /api/analyze?engine=easy|normal|hard で該当エンジンにルーティング
+ * - /api/comment は aiComment.js を利用（既存仕様維持）
+ */
+
+const express  = require("express");
+const cors     = require("cors");
+const path     = require("path");
+const fs       = require("fs");
+const { spawn }= require("child_process");
+const readline = require("readline");
+
+// ====== 設定（あなたの環境に合わせて必要なら編集） ======
+// 既定パス（環境変数で上書き可）
+const ENGINES = {
+  easy: {
+    exe:   process.env.KATAGO_EASY_EXE   || "C:\\tools\\katago\\engines\\easy_b6\\katago.exe",
+    model: process.env.KATAGO_EASY_MODEL || "C:\\tools\\katago\\engines\\easy_b6\\weights\\kata1-b6c96-s175395328-d26788732.txt.gz",
+    cfg:   process.env.KATAGO_EASY_CFG   || "C:\\tools\\katago\\engines\\easy_b6\\analysis.cfg",
+  },
+  normal: {
+    exe:   process.env.KATAGO_NORMAL_EXE   || "C:\\tools\\katago\\engines\\normal_b10\\katago.exe",
+    model: process.env.KATAGO_NORMAL_MODEL || "C:\\tools\\katago\\engines\\normal_b10\\weights\\kata1-b10c128-s1141046784-d204142634.txt.gz",
+    cfg:   process.env.KATAGO_NORMAL_CFG   || "C:\\tools\\katago\\engines\\normal_b10\\analysis.cfg",
+  },
+  hard: {
+    exe:   process.env.KATAGO_HARD_EXE   || "C:\\tools\\katago\\engines\\hard_b18\\katago.exe",
+    model: process.env.KATAGO_HARD_MODEL || "C:\\tools\\katago\\engines\\hard_b18\\weights\\kata1-b18c384nbt.bin.gz",
+    cfg:   process.env.KATAGO_HARD_CFG   || "C:\\tools\\katago\\engines\\hard_b18\\analysis.cfg",
+  },
+};
+
+const PORT = process.env.PORT || 5173;
+
+// ====== 便利関数 ======
+function mustExist(p, label) {
+  if (!fs.existsSync(p)) {
+    throw new Error(`${label} not found: ${p}`);
+  }
+}
+
+function sanitizeEngineName(name) {
+  const n = (name || "").toLowerCase();
+  return n === "easy" || n === "hard" ? n : "normal";
+}
+
+// ====== Express 準備 ======
+const app = express();
+app.use(cors({ origin: true }));
+app.use(express.json());
+
+// UI（index.html など）を同ディレクトリから配信
+app.use(express.static(path.join(__dirname)));
+
+// ====== KataGo 複数常駐 ======
+/**
+ * procs[name] = {
+ *   proc: ChildProcess,
+ *   rl:   Readline.Interface,
+ *   waiters: Map<id, {resolve, reject}>
+ * }
+ */
+const procs = {};
+
+function spawnEngine(name) {
+  const { exe, model, cfg } = ENGINES[name];
+
+  // 事前チェック（存在しないと落ちるのでエラーメッセージを早めに）
+  mustExist(exe,   `[${name}] katago.exe`);
+  mustExist(model, `[${name}] model`);
+  mustExist(cfg,   `[${name}] analysis.cfg`);
+
+  const args = ["analysis", "-model", model, "-config", cfg];
+  const proc = spawn(exe, args, { stdio: ["pipe", "pipe", "pipe"] });
+
+  proc.stdout.setEncoding("utf8");
+  proc.stderr.setEncoding("utf8");
+
+  const rl = readline.createInterface({ input: proc.stdout });
+  const waiters = new Map();
+
+  rl.on("line", (line) => {
+    // KataGo analysis は 1行に1 JSON で返してくる
+    let msg = null;
+    try {
+      msg = JSON.parse(line);
+    } catch (e) {
+      // JSON 以外の行は無視（進捗や空行など）
+      return;
+    }
+    const id = msg && msg.id;
+    if (id && waiters.has(id)) {
+      const { resolve } = waiters.get(id);
+      waiters.delete(id);
+      resolve(msg);
+    }
+  });
+
+  proc.stderr.on("data", (d) => {
+    const s = d.toString();
+    console.error(`[${name}]`, s.trim());
+  });
+
+  proc.on("exit", (code, signal) => {
+    console.error(`[${name}] exited: code=${code} signal=${signal}`);
+    // 落ちたら自動再起動（必要なければ削除）
+    setTimeout(() => {
+      try {
+        spawnEngine(name);
+      } catch (e) {
+        console.error(`[${name}] respawn failed:`, e);
+      }
+    }, 1500);
+  });
+
+  procs[name] = { proc, rl, waiters };
+  console.log(`[spawned] ${name} -> ${exe}`);
+}
+
+/**
+ * 指定エンジンに 1 リクエスト送る
+ * payload は {moves, rules, komi, maxVisits, ...} など
+ */
+function askKatago(name, payload) {
+  return new Promise((resolve, reject) => {
+    const eng = procs[name];
+    if (!eng || !eng.proc || eng.proc.killed) {
+      return reject(new Error(`engine "${name}" is not running`));
+    }
+    const id = `req_${Math.random().toString(36).slice(2)}`;
+    const body = { ...payload, id };
+
+    eng.waiters.set(id, { resolve, reject });
+
+    try {
+      eng.proc.stdin.write(JSON.stringify(body) + "\n");
+    } catch (e) {
+      eng.waiters.delete(id);
+      reject(e);
+    }
+
+    // タイムアウト（保険）
+    setTimeout(() => {
+      if (eng.waiters.has(id)) {
+        eng.waiters.delete(id);
+        reject(new Error(`engine "${name}" timeout for id=${id}`));
+      }
+    }, 30_000);
+  });
+}
+
+// 3エンジン起動
+["easy", "normal", "hard"].forEach(spawnEngine);
+
+// ====== API: KataGo 分析 ======
+/**
+ * POST /api/analyze?engine=easy|normal|hard
+ * body: { moves, initialStones?, rules?, komi?, boardXSize?, boardYSize?, maxVisits?, ... }
+ * return: { ok, bestMove, katago }
+ */
+app.post("/api/analyze", async (req, res) => {
+  try {
+    const engine = sanitizeEngineName(req.query.engine || "normal");
+
+    // クライアント（index.html）側で maxVisits を入れてこない場合でも、
+    // analysis.cfg 側の設定が効くので必須ではない。
+    const payload = req.body || {};
+    if (!payload.rules) payload.rules = "japanese";
+    if (typeof payload.komi !== "number") payload.komi = 6.5;
+
+    const katagoResp = await askKatago(engine, payload);
+
+    // 最善手：visits 多い順 or KataGo返却の moveInfos[0]
+    let bestMove = null;
+    if (katagoResp && Array.isArray(katagoResp.moveInfos) && katagoResp.moveInfos.length) {
+      // 訪問順に一応ソートして最上位を採用（返却順が常に最上位とは限らないための保険）
+      const sorted = [...katagoResp.moveInfos].sort((a, b) => (b.visits || 0) - (a.visits || 0));
+      bestMove = (sorted[0] && sorted[0].move) || null;
+    }
+
+    return res.json({ ok: true, bestMove, katago: katagoResp });
+  } catch (e) {
+    console.error("[/api/analyze] error:", e);
+    return res.status(500).json({ ok: false, error: String(e && e.message ? e.message : e) });
+  }
+});
+
+// ====== API: コメント生成（既存の aiComment.js を使用） ======
+/**
+ * POST /api/comment
+ * body: { skeleton: {...}, banPhrases:[], lengthHint:[] }
+ * return: { text }
+ */
+let aiComment = null;
+try {
+  aiComment = require("./aiComment");
+} catch (e) {
+  console.warn("aiComment.js not found or failed to load. /api/comment will return a fallback.");
+}
+
+app.post("/api/comment", async (req, res) => {
+  try {
+    if (!aiComment || typeof aiComment.generateComment !== "function") {
+      return res.json({ text: "（コメント機能は現在オフラインです）" });
+    }
+    const { skeleton, banPhrases, lengthHint } = req.body || {};
+    const text = await aiComment.generateComment({ skeleton, banPhrases, lengthHint });
+    return res.json({ text });
+  } catch (e) {
+    console.error("[/api/comment] error:", e);
+    return res.status(500).json({ error: "openai_failed", detail: String(e && e.message ? e.message : e) });
+  }
+});
+
+// ====== サーバ起動 ======
+app.listen(PORT, () => {
+  console.log(`Server listening on http://localhost:${PORT}`);
+});
+
+// ====== 終了処理（Ctrl+C 等） ======
+function shutdown() {
+  console.log("Shutting down engines...");
+  for (const name of Object.keys(procs)) {
+    try {
+      procs[name].proc.kill();
+    } catch {}
+  }
+  process.exit(0);
+}
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);
